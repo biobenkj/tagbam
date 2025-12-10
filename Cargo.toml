@@ -9,7 +9,7 @@ readme = "README.md"
 license = "MIT OR Apache-2.0"
 keywords = ["bioinformatics", "bam", "cli", "single-cell"]
 categories = ["command-line-utilities", "science"]
-rust-version = "1.82"
+rust-version = "1.83"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }

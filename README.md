@@ -71,7 +71,7 @@ This produces:
 
 ## MSRV
 
-- Minimum Supported Rust Version: **1.82**
+- Minimum Supported Rust Version: **1.83**
 
 ## License
 
