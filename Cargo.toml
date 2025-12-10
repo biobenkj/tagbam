@@ -1,0 +1,27 @@
+[package]
+name = "tagbam"
+version = "0.1.0"
+edition = "2021"
+description = "Re-tag BAM files by parsing cell barcodes and UMIs from read names"
+repository = "https://github.com/biobenkj/tagbam"
+homepage = "https://github.com/biobenkj/tagbam"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+keywords = ["bioinformatics", "bam", "cli", "single-cell"]
+categories = ["command-line-utilities", "science"]
+rust-version = "1.82"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0"
+rust-htslib = "0.49"
+
+[dev-dependencies]
+assert_cmd = "2.1"
+predicates = "3"
+tempfile = "3.10"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
