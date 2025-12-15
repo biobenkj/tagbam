@@ -131,8 +131,8 @@ fn parse_bq_token(header: &str) -> Option<BqQuals> {
 
 /// Load FASTQ into memory and build a map: read name -> parsed barcode/UMI qualities.
 fn load_bq_map(fastq_path: &Path) -> Result<HashMap<String, BqQuals>> {
-    let file =
-        File::open(fastq_path).with_context(|| format!("Failed to open FASTQ: {:?}", fastq_path))?;
+    let file = File::open(fastq_path)
+        .with_context(|| format!("Failed to open FASTQ: {:?}", fastq_path))?;
     let mut reader = BufReader::new(file).lines();
     let mut map = HashMap::new();
 

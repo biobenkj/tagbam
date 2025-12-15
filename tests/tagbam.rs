@@ -241,7 +241,10 @@ fn fastq_bq_overrides_barcode_qualities() {
 
     let mut reader = bam::Reader::from_path(&output_bam).unwrap();
     let record = reader.records().next().unwrap().unwrap();
-    assert_eq!(get_tag_string(&record, b"CY"), Some("123456789".to_string()));
+    assert_eq!(
+        get_tag_string(&record, b"CY"),
+        Some("123456789".to_string())
+    );
     assert_eq!(get_tag_string(&record, b"UY"), Some("XYZ".to_string()));
 }
 
