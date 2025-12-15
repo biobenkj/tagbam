@@ -11,9 +11,9 @@ Reads from read names in format: `{uuid}_{i7}-{i5}-{CBC}_{UMI}`
 
 Creates BAM tags:
 - `CB:Z` - Cell barcode (concatenated i7+i5+CBC)
-- `CY:Z` - Cell barcode quality (perfect quality: all 'I')
+- `CY:Z` - Cell barcode quality (from FASTQ `|BQ:` header if provided, otherwise perfect quality)
 - `UB:Z` - UMI sequence
-- `UY:Z` - UMI quality (perfect quality: all 'I')
+- `UY:Z` - UMI quality (from FASTQ `|BQ:` header if provided, otherwise perfect quality)
 
 ## Install
 
@@ -59,9 +59,21 @@ Read names must follow this format: `{uuid}_{i7}-{i5}-{CBC}_{UMI}`
 
 This produces:
 - `CB:Z:TTGGCTCCGGTCGGCGACTTGA` (22 bases: i7+i5+CBC concatenated)
-- `CY:Z:IIIIIIIIIIIIIIIIIIIIII` (22 I's for perfect quality Q40)
+- `CY:Z:IIIIIIIIIIIIIIIIIIIIII` (22 I's for perfect quality Q40 if no `--fastq-bq`)
 - `UB:Z:GAAGCAGT` (8 bases)
-- `UY:Z:IIIIIIII` (8 I's for perfect quality Q40)
+- `UY:Z:IIIIIIII` (8 I's for perfect quality Q40 if no `--fastq-bq`)
+
+### Supplying barcode/UMI qualities from FASTQ (`--fastq-bq`)
+
+If your FASTQ headers include a `|BQ:` token (e.g., `|BQ:i7:<qual>;i5:<qual>;CBC:<qual>;UMI:<qual>`), you can supply that FASTQ to reuse the barcode/UMI qualities when tagging the BAM:
+
+```bash
+tagbam --input input.bam --output tagged.bam --fastq-bq demuxed.fastq
+```
+
+- `CY` is populated from concatenated i7+i5+CBC qualities in the `|BQ:` token.
+- `UY` is populated from the `UMI` quality in the `|BQ:` token if present; otherwise it falls back to perfect quality.
+- Reads without a `|BQ:` token (or absent in the FASTQ map) still receive perfect-quality tags.
 
 ## Behavior
 
