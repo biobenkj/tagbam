@@ -2,7 +2,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use rust_htslib::bam;
 use rust_htslib::bam::Read;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::{fs::File, str};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -31,6 +34,10 @@ struct Cli {
     /// Skip reads with unparseable names instead of erroring
     #[arg(long)]
     skip_unparseable: bool,
+
+    /// Optional FASTQ with BQ tag in header for barcode qualities (loads into memory)
+    #[arg(long, value_name = "FASTQ")]
+    fastq_bq: Option<PathBuf>,
 }
 
 /// Parsed components from read name: {uuid}_{i7}-{i5}-{CBC}_{UMI}
@@ -83,6 +90,80 @@ fn perfect_quality(length: usize) -> Vec<u8> {
     vec![b'I'; length]
 }
 
+/// Parsed barcode/UMI qualities from a BQ token.
+#[derive(Debug, Clone)]
+struct BqQuals {
+    cb: Vec<u8>,
+    umi: Option<Vec<u8>>,
+}
+
+/// Parse `|BQ:` token from a FASTQ header and return concatenated i7+i5+CBC qualities and UMI qualities if present.
+fn parse_bq_token(header: &str) -> Option<BqQuals> {
+    let bq_start = header.find("|BQ:")?;
+    let token = &header[bq_start + 4..];
+    let token = token.split_whitespace().next().unwrap_or(token);
+
+    let mut i7 = None;
+    let mut i5 = None;
+    let mut cbc = None;
+    let mut umi = None;
+
+    for part in token.split(';') {
+        if let Some((label, qual)) = part.split_once(':') {
+            match label {
+                "i7" => i7 = Some(qual.to_string()),
+                "i5" => i5 = Some(qual.to_string()),
+                "CBC" => cbc = Some(qual.to_string()),
+                "UMI" => umi = Some(qual.to_string()),
+                _ => {}
+            }
+        }
+    }
+
+    match (i7, i5, cbc) {
+        (Some(a), Some(b), Some(c)) => Some(BqQuals {
+            cb: [a, b, c].concat().into_bytes(),
+            umi: umi.map(|u| u.into_bytes()),
+        }),
+        _ => None,
+    }
+}
+
+/// Load FASTQ into memory and build a map: read name -> parsed barcode/UMI qualities.
+fn load_bq_map(fastq_path: &Path) -> Result<HashMap<String, BqQuals>> {
+    let file =
+        File::open(fastq_path).with_context(|| format!("Failed to open FASTQ: {:?}", fastq_path))?;
+    let mut reader = BufReader::new(file).lines();
+    let mut map = HashMap::new();
+
+    loop {
+        let header = match reader.next() {
+            Some(Ok(h)) => h,
+            Some(Err(e)) => return Err(e).context("Failed reading FASTQ header"),
+            None => break,
+        };
+
+        // Skip seq, plus, qual
+        let _ = reader.next();
+        let _ = reader.next();
+        let _ = reader.next();
+
+        let name = header
+            .strip_prefix('@')
+            .unwrap_or(&header)
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string();
+
+        if let Some(quals) = parse_bq_token(&header) {
+            map.insert(name, quals);
+        }
+    }
+
+    Ok(map)
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -90,6 +171,12 @@ fn main() -> Result<()> {
     if cli.output.is_none() && !cli.in_place {
         anyhow::bail!("Either --output or --in-place must be specified");
     }
+
+    let bq_map = if let Some(ref fastq) = cli.fastq_bq {
+        Some(load_bq_map(fastq)?)
+    } else {
+        None
+    };
 
     let mut reader = bam::Reader::from_path(&cli.input)
         .with_context(|| format!("Failed to open input BAM: {:?}", cli.input))?;
@@ -125,7 +212,7 @@ fn main() -> Result<()> {
         let mut record = result.context("Failed to read BAM record")?;
         n_total += 1;
 
-        let qname = std::str::from_utf8(record.qname()).context("Read name is not valid UTF-8")?;
+        let qname = str::from_utf8(record.qname()).context("Read name is not valid UTF-8")?;
 
         match parse_read_name(qname) {
             Ok(components) => {
@@ -145,15 +232,32 @@ fn main() -> Result<()> {
                     // Concatenate cell barcode: i7 + i5 + CBC
                     let cell_barcode =
                         format!("{}{}{}", components.i7, components.i5, components.cbc);
-                    let cell_barcode_qual = perfect_quality(cell_barcode.len());
-
-                    let umi_qual = perfect_quality(components.umi.len());
+                    let (cell_barcode_qual, umi_qual) = if let Some(bq_map) = bq_map.as_ref() {
+                        if let Some(quals) = bq_map.get(qname) {
+                            let cbq = quals.cb.clone();
+                            let umi_q = quals
+                                .umi
+                                .clone()
+                                .unwrap_or_else(|| perfect_quality(components.umi.len()));
+                            (cbq, umi_q)
+                        } else {
+                            (
+                                perfect_quality(cell_barcode.len()),
+                                perfect_quality(components.umi.len()),
+                            )
+                        }
+                    } else {
+                        (
+                            perfect_quality(cell_barcode.len()),
+                            perfect_quality(components.umi.len()),
+                        )
+                    };
 
                     // Add tags to BAM record
                     record.push_aux(b"CB", bam::record::Aux::String(&cell_barcode))?;
                     record.push_aux(
                         b"CY",
-                        bam::record::Aux::String(std::str::from_utf8(&cell_barcode_qual).unwrap()),
+                        bam::record::Aux::String(str::from_utf8(&cell_barcode_qual).unwrap()),
                     )?;
                     record.push_aux(b"UB", bam::record::Aux::String(&components.umi))?;
                     record.push_aux(

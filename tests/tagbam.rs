@@ -1,6 +1,8 @@
 use assert_cmd::Command;
 use rust_htslib::bam;
 use rust_htslib::bam::Read;
+use std::fs::File;
+use std::io::Write;
 use std::path::Path;
 use tempfile::TempDir;
 
@@ -206,6 +208,41 @@ fn skip_unparseable_flag() {
     // Third record should have tags
     let rec3 = records[2].as_ref().unwrap();
     assert_eq!(get_tag_string(rec3, b"CB"), Some("DDDEEEFFF".to_string()));
+}
+
+#[test]
+fn fastq_bq_overrides_barcode_qualities() {
+    let td = TempDir::new().unwrap();
+    let input_bam = td.path().join("input.bam");
+    let output_bam = td.path().join("output.bam");
+    let fastq_path = td.path().join("reads.fastq");
+
+    let read_name = "uuid1_AAA-BBB-CCC_UUU";
+    create_test_bam(&input_bam, &[read_name]).unwrap();
+
+    let mut fq = File::create(&fastq_path).unwrap();
+    writeln!(
+        fq,
+        "@{read_name} cell|Barcodes:i7:AAA;i5:BBB;CBC:CCC|UMI:UUU|orientation:+|BQ:i7:123;i5:456;CBC:789;UMI:XYZ\n\
+         AAAAAAAAA\n+\nIIIIIIIII"
+    )
+    .unwrap();
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("tagbam"));
+    cmd.args([
+        "--input",
+        input_bam.to_str().unwrap(),
+        "--output",
+        output_bam.to_str().unwrap(),
+        "--fastq-bq",
+        fastq_path.to_str().unwrap(),
+    ]);
+    cmd.assert().success();
+
+    let mut reader = bam::Reader::from_path(&output_bam).unwrap();
+    let record = reader.records().next().unwrap().unwrap();
+    assert_eq!(get_tag_string(&record, b"CY"), Some("123456789".to_string()));
+    assert_eq!(get_tag_string(&record, b"UY"), Some("XYZ".to_string()));
 }
 
 #[test]
