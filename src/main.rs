@@ -38,6 +38,10 @@ struct Cli {
     /// Optional FASTQ with BQ tag in header for barcode qualities (loads into memory)
     #[arg(long, value_name = "FASTQ")]
     fastq_bq: Option<PathBuf>,
+
+    /// Number of threads for BAM compression/decompression
+    #[arg(short = 't', long, default_value = "4")]
+    threads: usize,
 }
 
 /// Parsed components from read name: {uuid}_{i7}-{i5}-{CBC}_{UMI}
@@ -181,6 +185,9 @@ fn main() -> Result<()> {
     let mut reader = bam::Reader::from_path(&cli.input)
         .with_context(|| format!("Failed to open input BAM: {:?}", cli.input))?;
 
+    // Enable multi-threaded decompression
+    reader.set_threads(cli.threads)?;
+
     let header = bam::Header::from_template(reader.header());
 
     // Determine output path: either specified output, or a temp file for in-place mode
@@ -203,6 +210,9 @@ fn main() -> Result<()> {
 
     let mut writer = bam::Writer::from_path(&output_path, &header, bam::Format::Bam)
         .with_context(|| format!("Failed to create output BAM: {:?}", output_path))?;
+
+    // Enable multi-threaded compression
+    writer.set_threads(cli.threads)?;
 
     let mut n_total: u64 = 0;
     let mut n_tagged: u64 = 0;

@@ -47,6 +47,14 @@ tagbam --input input.bam --output tagged.bam --skip-unparseable
 
 By default, the tool errors on unparseable read names. Use `--skip-unparseable` to continue processing and skip those reads with a warning.
 
+### Multi-threaded compression/decompression
+
+```bash
+tagbam --input input.bam --output tagged.bam --threads 8
+```
+
+Control the number of threads used for BAM compression and decompression (default: 4). Increasing threads can significantly improve performance on large files. A good starting point is to match your CPU core count.
+
 ## Read name format
 
 Read names must follow this format: `{uuid}_{i7}-{i5}-{CBC}_{UMI}`
