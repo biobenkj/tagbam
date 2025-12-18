@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use flate2::read::GzDecoder;
 use rust_htslib::bam;
 use rust_htslib::bam::Read;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read as IoRead, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::{fs::File, str};
 
@@ -35,7 +36,7 @@ struct Cli {
     #[arg(long)]
     skip_unparseable: bool,
 
-    /// Optional FASTQ with BQ tag in header for barcode qualities (loads into memory)
+    /// Optional FASTQ (optionally gzipped) with BQ tag in header for barcode qualities (loads into memory)
     #[arg(long, value_name = "FASTQ")]
     fastq_bq: Option<PathBuf>,
 
@@ -135,9 +136,7 @@ fn parse_bq_token(header: &str) -> Option<BqQuals> {
 
 /// Load FASTQ into memory and build a map: read name -> parsed barcode/UMI qualities.
 fn load_bq_map(fastq_path: &Path) -> Result<HashMap<String, BqQuals>> {
-    let file = File::open(fastq_path)
-        .with_context(|| format!("Failed to open FASTQ: {:?}", fastq_path))?;
-    let mut reader = BufReader::new(file).lines();
+    let mut reader = open_fastq_reader(fastq_path)?.lines();
     let mut map = HashMap::new();
 
     loop {
@@ -166,6 +165,32 @@ fn load_bq_map(fastq_path: &Path) -> Result<HashMap<String, BqQuals>> {
     }
 
     Ok(map)
+}
+
+fn open_fastq_reader(fastq_path: &Path) -> Result<Box<dyn BufRead>> {
+    let mut file = File::open(fastq_path)
+        .with_context(|| format!("Failed to open FASTQ: {:?}", fastq_path))?;
+
+    let mut magic = [0u8; 2];
+    let mut is_gzip = false;
+    if let Ok(n) = file.read(&mut magic) {
+        if n == 2 && magic == [0x1f, 0x8b] {
+            is_gzip = true;
+        }
+    }
+    file.seek(SeekFrom::Start(0))
+        .context("Failed to rewind FASTQ file")?;
+
+    let has_gz_ext = fastq_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("gz"));
+
+    if is_gzip || has_gz_ext {
+        Ok(Box::new(BufReader::new(GzDecoder::new(file))))
+    } else {
+        Ok(Box::new(BufReader::new(file)))
+    }
 }
 
 fn main() -> Result<()> {
