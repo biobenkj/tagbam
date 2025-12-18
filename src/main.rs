@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use flate2::read::GzDecoder;
 use rust_htslib::bam;
 use rust_htslib::bam::Read;
+use rust_htslib::bgzf;
+use rust_htslib::tpool::ThreadPool;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read as IoRead, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, BufWriter, Read as IoRead, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::{fs::File, str};
 
@@ -36,9 +37,13 @@ struct Cli {
     #[arg(long)]
     skip_unparseable: bool,
 
-    /// Optional FASTQ (optionally gzipped) with BQ tag in header for barcode qualities (loads into memory)
+    /// Optional FASTQ (plain, gzip, or bgzip) with BQ tag in header for barcode qualities (loads into memory)
     #[arg(long, value_name = "FASTQ")]
     fastq_bq: Option<PathBuf>,
+
+    /// Optional cache file for --fastq-bq (loads if present, otherwise created)
+    #[arg(long, value_name = "CACHE", requires = "fastq_bq")]
+    fastq_bq_cache: Option<PathBuf>,
 
     /// Number of threads for BAM compression/decompression
     #[arg(short = 't', long, default_value = "4")]
@@ -102,6 +107,48 @@ struct BqQuals {
     umi: Option<Vec<u8>>,
 }
 
+const BQ_CACHE_MAGIC: &[u8; 8] = b"TBQMAP01";
+
+struct FastqReader {
+    reader: bgzf::Reader,
+    _tpool: Option<ThreadPool>,
+}
+
+impl FastqReader {
+    fn from_path(path: &Path, threads: usize) -> Result<Self> {
+        let mut reader = bgzf::Reader::from_path(path)
+            .with_context(|| format!("Failed to open FASTQ: {:?}", path))?;
+        let tpool = if threads > 1 {
+            let is_bgzip = bgzf::is_bgzip(path)
+                .with_context(|| format!("Failed to detect bgzip FASTQ: {:?}", path))?;
+            if is_bgzip {
+                let thread_count =
+                    u32::try_from(threads).context("FASTQ thread count exceeds u32")?;
+                let tpool =
+                    ThreadPool::new(thread_count).context("Failed to create FASTQ thread pool")?;
+                reader
+                    .set_thread_pool(&tpool)
+                    .context("Failed to set FASTQ thread pool")?;
+                Some(tpool)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Ok(Self {
+            reader,
+            _tpool: tpool,
+        })
+    }
+}
+
+impl IoRead for FastqReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.reader.read(buf)
+    }
+}
+
 /// Parse `|BQ:` token from a FASTQ header and return concatenated i7+i5+CBC qualities and UMI qualities if present.
 fn parse_bq_token(header: &str) -> Option<BqQuals> {
     let bq_start = header.find("|BQ:")?;
@@ -135,8 +182,8 @@ fn parse_bq_token(header: &str) -> Option<BqQuals> {
 }
 
 /// Load FASTQ into memory and build a map: read name -> parsed barcode/UMI qualities.
-fn load_bq_map(fastq_path: &Path) -> Result<HashMap<String, BqQuals>> {
-    let mut reader = open_fastq_reader(fastq_path)?.lines();
+fn load_bq_map(fastq_path: &Path, threads: usize) -> Result<HashMap<String, BqQuals>> {
+    let mut reader = open_fastq_reader(fastq_path, threads)?.lines();
     let mut map = HashMap::new();
 
     loop {
@@ -167,30 +214,129 @@ fn load_bq_map(fastq_path: &Path) -> Result<HashMap<String, BqQuals>> {
     Ok(map)
 }
 
-fn open_fastq_reader(fastq_path: &Path) -> Result<Box<dyn BufRead>> {
-    let mut file = File::open(fastq_path)
-        .with_context(|| format!("Failed to open FASTQ: {:?}", fastq_path))?;
+fn open_fastq_reader(fastq_path: &Path, threads: usize) -> Result<Box<dyn BufRead>> {
+    let reader = FastqReader::from_path(fastq_path, threads)?;
+    Ok(Box::new(BufReader::new(reader)))
+}
 
-    let mut magic = [0u8; 2];
-    let mut is_gzip = false;
-    if let Ok(n) = file.read(&mut magic) {
-        if n == 2 && magic == [0x1f, 0x8b] {
-            is_gzip = true;
+fn load_bq_map_with_cache(
+    fastq_path: &Path,
+    cache_path: Option<&Path>,
+    threads: usize,
+) -> Result<HashMap<String, BqQuals>> {
+    if let Some(cache_path) = cache_path {
+        if cache_path.exists() {
+            return read_bq_cache(cache_path)
+                .with_context(|| format!("Failed to read BQ cache: {:?}", cache_path));
         }
     }
-    file.seek(SeekFrom::Start(0))
-        .context("Failed to rewind FASTQ file")?;
 
-    let has_gz_ext = fastq_path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("gz"));
-
-    if is_gzip || has_gz_ext {
-        Ok(Box::new(BufReader::new(GzDecoder::new(file))))
-    } else {
-        Ok(Box::new(BufReader::new(file)))
+    let map = load_bq_map(fastq_path, threads)?;
+    if let Some(cache_path) = cache_path {
+        write_bq_cache(cache_path, &map)
+            .with_context(|| format!("Failed to write BQ cache: {:?}", cache_path))?;
     }
+    Ok(map)
+}
+
+fn read_bq_cache(cache_path: &Path) -> Result<HashMap<String, BqQuals>> {
+    let file = File::open(cache_path)
+        .with_context(|| format!("Failed to open BQ cache: {:?}", cache_path))?;
+    let mut reader = BufReader::new(file);
+
+    let mut magic = [0u8; 8];
+    reader
+        .read_exact(&mut magic)
+        .context("Failed to read BQ cache header")?;
+    if &magic != BQ_CACHE_MAGIC {
+        anyhow::bail!("BQ cache has invalid header");
+    }
+
+    let count = read_u64(&mut reader).context("Failed to read BQ cache entry count")?;
+    let count_usize = usize::try_from(count).context("BQ cache entry count exceeds usize")?;
+    let mut map = HashMap::with_capacity(count_usize);
+
+    for _ in 0..count_usize {
+        let name_bytes = read_bytes(&mut reader).context("Failed to read BQ cache name")?;
+        let cb = read_bytes(&mut reader).context("Failed to read BQ cache CB qualities")?;
+        let umi_present = read_u8(&mut reader).context("Failed to read BQ cache UMI presence")?;
+        let umi = if umi_present == 1 {
+            Some(read_bytes(&mut reader).context("Failed to read BQ cache UMI qualities")?)
+        } else {
+            None
+        };
+
+        let name = String::from_utf8(name_bytes).context("BQ cache contains non-UTF8 read name")?;
+        map.insert(name, BqQuals { cb, umi });
+    }
+
+    Ok(map)
+}
+
+fn write_bq_cache(cache_path: &Path, map: &HashMap<String, BqQuals>) -> Result<()> {
+    let file = File::create(cache_path)
+        .with_context(|| format!("Failed to create BQ cache: {:?}", cache_path))?;
+    let mut writer = BufWriter::new(file);
+
+    writer
+        .write_all(BQ_CACHE_MAGIC)
+        .context("Failed to write BQ cache header")?;
+    let count = u64::try_from(map.len()).context("BQ cache entry count exceeds u64")?;
+    write_u64(&mut writer, count).context("Failed to write BQ cache entry count")?;
+
+    for (name, quals) in map {
+        write_bytes(&mut writer, name.as_bytes()).context("Failed to write BQ cache name")?;
+        write_bytes(&mut writer, &quals.cb).context("Failed to write BQ cache CB qualities")?;
+        match &quals.umi {
+            Some(umi) => {
+                write_u8(&mut writer, 1).context("Failed to write BQ cache UMI presence")?;
+                write_bytes(&mut writer, umi).context("Failed to write BQ cache UMI qualities")?;
+            }
+            None => {
+                write_u8(&mut writer, 0).context("Failed to write BQ cache UMI presence")?;
+            }
+        }
+    }
+
+    writer.flush().context("Failed to flush BQ cache")?;
+    Ok(())
+}
+
+fn read_u64<R: IoRead>(reader: &mut R) -> Result<u64> {
+    let mut buf = [0u8; 8];
+    reader.read_exact(&mut buf)?;
+    Ok(u64::from_le_bytes(buf))
+}
+
+fn write_u64<W: IoWrite>(writer: &mut W, value: u64) -> Result<()> {
+    writer.write_all(&value.to_le_bytes())?;
+    Ok(())
+}
+
+fn read_u8<R: IoRead>(reader: &mut R) -> Result<u8> {
+    let mut buf = [0u8; 1];
+    reader.read_exact(&mut buf)?;
+    Ok(buf[0])
+}
+
+fn write_u8<W: IoWrite>(writer: &mut W, value: u8) -> Result<()> {
+    writer.write_all(&[value])?;
+    Ok(())
+}
+
+fn read_bytes<R: IoRead>(reader: &mut R) -> Result<Vec<u8>> {
+    let len = read_u64(reader)?;
+    let len_usize = usize::try_from(len).context("BQ cache length exceeds usize")?;
+    let mut buf = vec![0u8; len_usize];
+    reader.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+fn write_bytes<W: IoWrite>(writer: &mut W, bytes: &[u8]) -> Result<()> {
+    let len = u64::try_from(bytes.len()).context("BQ cache length exceeds u64")?;
+    write_u64(writer, len)?;
+    writer.write_all(bytes)?;
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -202,7 +348,11 @@ fn main() -> Result<()> {
     }
 
     let bq_map = if let Some(ref fastq) = cli.fastq_bq {
-        Some(load_bq_map(fastq)?)
+        Some(load_bq_map_with_cache(
+            fastq,
+            cli.fastq_bq_cache.as_deref(),
+            cli.threads,
+        )?)
     } else {
         None
     };
@@ -342,6 +492,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn parse_valid_read_name() {
@@ -393,5 +544,34 @@ mod tests {
     fn perfect_quality_ascii() {
         let qual = perfect_quality(5);
         assert_eq!(std::str::from_utf8(&qual).unwrap(), "IIIII");
+    }
+
+    #[test]
+    fn bq_cache_roundtrip() {
+        let mut map = HashMap::new();
+        map.insert(
+            "read1".to_string(),
+            BqQuals {
+                cb: b"ABC".to_vec(),
+                umi: Some(b"XYZ".to_vec()),
+            },
+        );
+        map.insert(
+            "read2".to_string(),
+            BqQuals {
+                cb: b"QQ".to_vec(),
+                umi: None,
+            },
+        );
+
+        let file = NamedTempFile::new().unwrap();
+        write_bq_cache(file.path(), &map).unwrap();
+        let loaded = read_bq_cache(file.path()).unwrap();
+
+        assert_eq!(loaded.len(), map.len());
+        assert_eq!(loaded.get("read1").unwrap().cb, b"ABC".to_vec());
+        assert_eq!(loaded.get("read1").unwrap().umi.as_ref().unwrap(), b"XYZ");
+        assert_eq!(loaded.get("read2").unwrap().cb, b"QQ".to_vec());
+        assert!(loaded.get("read2").unwrap().umi.is_none());
     }
 }

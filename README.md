@@ -73,10 +73,18 @@ This produces:
 
 ### Supplying barcode/UMI qualities from FASTQ (`--fastq-bq`)
 
-If your FASTQ headers include a `|BQ:` token (e.g., `|BQ:i7:<qual>;i5:<qual>;CBC:<qual>;UMI:<qual>`), you can supply that FASTQ to reuse the barcode/UMI qualities when tagging the BAM:
+If your FASTQ headers include a `|BQ:` token (e.g., `|BQ:i7:<qual>;i5:<qual>;CBC:<qual>;UMI:<qual>`), you can supply that FASTQ to reuse the barcode/UMI qualities when tagging the BAM. Plain, gzip, and bgzip FASTQ inputs are supported:
 
 ```bash
 tagbam --input input.bam --output tagged.bam --fastq-bq demuxed.fastq
+```
+
+- To avoid re-parsing large FASTQs on repeated runs, provide a cache path with `--fastq-bq-cache`. If the cache exists it is loaded; otherwise it is created after parsing:
+
+```bash
+tagbam --input input.bam --output tagged.bam \
+  --fastq-bq demuxed.fastq.gz \
+  --fastq-bq-cache demuxed.bq.cache
 ```
 
 - `CY` is populated from concatenated i7+i5+CBC qualities in the `|BQ:` token.
